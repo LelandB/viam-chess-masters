@@ -84,6 +84,11 @@ Python 3.11 is selected by `.python-version`.
 uv sync
 ```
 
+If `uv` says that an active `VIRTUAL_ENV` points somewhere other than this
+repository's `.venv`, that warning is not a robot or SDK failure. Either run
+`deactivate` before the commands below, or let `uv run` ignore the unrelated
+environment and use the project environment automatically.
+
 ## Verification ladder
 
 Run the unit tests without connecting to hardware:
@@ -154,9 +159,12 @@ the physical plan uses the circle/top-depth locator because a rectangular color
 bounding box can include the table or land on one side of the cylinder.
 
 The label is a controlled alias for this workcell, not general shape
-classification. If another large saturated-yellow object enters the view, the
-application will fail closed unless exactly one `circle-yellow` candidate and
-one nearby circular top are present.
+classification. The color detector may return multiple saturated-yellow
+regions, including rectangular blocks. The SDK analyzes those boxes against
+the exact same camera image and selects the target only when exactly one nearby
+circular top is present. It fails closed when no circular top or multiple
+circular tops match, so two visible yellow cylinders remain intentionally
+ambiguous.
 
 The saved `yellow-cylinder-detector` calibration is:
 

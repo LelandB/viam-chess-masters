@@ -367,8 +367,15 @@ async def locate_target(
     )
 
 
-def find_target_circle(image_bytes: bytes, detection: Any) -> ImageCircle:
-    """Find one circular top near a color-detector candidate."""
+def find_target_circle(
+    image_bytes: bytes,
+    detections: Iterable[Any],
+) -> ImageCircle:
+    """Find one circular top associated with any matching color candidate."""
+    candidates = tuple(detections)
+    if not candidates:
+        raise DetectionError("No matching color candidates were available")
+
     encoded = np.frombuffer(image_bytes, dtype=np.uint8)
     grayscale = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
     if grayscale is None:
@@ -387,17 +394,25 @@ def find_target_circle(image_bytes: bytes, detection: Any) -> ImageCircle:
     if circles is None:
         raise DetectionError("No circular top was found near the color candidate")
 
-    candidate_x = (detection.x_min + detection.x_max) / 2
-    candidate_y = (detection.y_min + detection.y_max) / 2
+    candidate_centers = [
+        (
+            (detection.x_min + detection.x_max) / 2,
+            (detection.y_min + detection.y_max) / 2,
+        )
+        for detection in candidates
+    ]
     nearby = [
         ImageCircle(float(x), float(y), float(radius))
         for x, y, radius in circles[0]
-        if math.hypot(x - candidate_x, y - candidate_y) <= radius * 1.5
+        if any(
+            math.hypot(x - candidate_x, y - candidate_y) <= radius * 1.5
+            for candidate_x, candidate_y in candidate_centers
+        )
     ]
     if len(nearby) != 1:
         raise DetectionError(
-            "Expected exactly one circular top near the color candidate; "
-            f"found {len(nearby)}"
+            "Expected exactly one circular top associated with "
+            f"{len(candidates)} color candidate(s); found {len(nearby)}"
         )
     return nearby[0]
 
@@ -469,22 +484,6 @@ async def _locate_circle_target_once(
     detector: VisionClient,
     settings: Settings,
 ) -> Target:
-    detections = await detector.get_detections_from_camera(
-        settings.camera_name,
-        timeout=settings.detection_timeout_s,
-    )
-    matches = [
-        detection
-        for detection in detections
-        if fnmatchcase(detection.class_name, settings.target_label)
-    ]
-    if len(matches) != 1:
-        labels = ", ".join(d.class_name for d in detections) or "none"
-        raise DetectionError(
-            f"Expected exactly one 2D candidate matching {settings.target_label!r}; "
-            f"found {len(matches)}. Observed labels: {labels}"
-        )
-
     images, _ = await camera.get_images(
         filter_source_names=["color"],
         timeout=settings.detection_timeout_s,
@@ -495,7 +494,29 @@ async def _locate_circle_target_once(
             f"Expected one color image from {settings.camera_name}; "
             f"found {len(color_images)}"
         )
-    circle = find_target_circle(color_images[0].data, matches[0])
+    color_image = color_images[0]
+    # Analyze the captured image itself. Calling get_detections_from_camera and
+    # then fetching an image can return two different frames, which makes the
+    # bounding boxes and Hough-circle coordinates disagree.
+    detections = await detector.get_detections(
+        color_image,
+        timeout=settings.detection_timeout_s,
+    )
+    matches = [
+        detection
+        for detection in detections
+        if fnmatchcase(detection.class_name, settings.target_label)
+    ]
+    if not matches:
+        labels = ", ".join(d.class_name for d in detections) or "none"
+        raise DetectionError(
+            f"Expected at least one 2D candidate matching {settings.target_label!r}; "
+            f"found 0. Observed labels: {labels}"
+        )
+    # A color detector can legitimately return other yellow shapes. Shape is
+    # resolved here: exactly one matching color region must be associated with
+    # one circular top, while non-circular yellow regions are ignored.
+    circle = find_target_circle(color_image.data, matches)
 
     properties = await camera.get_properties(timeout=settings.rpc_timeout_s)
     intrinsics = properties.intrinsic_parameters

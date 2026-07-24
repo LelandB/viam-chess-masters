@@ -17,6 +17,7 @@ from robot_app import (
     ImageCircle,
     Settings,
     WorkspaceBounds,
+    _locate_circle_target_once,
     build_parser,
     build_plan,
     camera_point_at_circle,
@@ -181,11 +182,105 @@ class CircleLocalizationTests(unittest.TestCase):
         self.assertTrue(encoded)
         detection = SimpleNamespace(x_min=345, x_max=365, y_min=240, y_max=270)
 
-        circle = find_target_circle(jpeg.tobytes(), detection)
+        circle = find_target_circle(jpeg.tobytes(), [detection])
 
         self.assertAlmostEqual(circle.x_px, 400, delta=3)
         self.assertAlmostEqual(circle.y_px, 250, delta=3)
         self.assertAlmostEqual(circle.radius_px, 45, delta=4)
+
+    def test_selects_circular_candidate_from_multiple_yellow_regions(self):
+        image = np.full((480, 640, 3), 35, dtype=np.uint8)
+        cv2.rectangle(image, (80, 80), (180, 200), (0, 220, 255), -1)
+        cv2.circle(image, (400, 250), 45, (0, 220, 255), -1)
+        cv2.circle(image, (400, 250), 45, (10, 10, 10), 3)
+        encoded, jpeg = cv2.imencode(".jpg", image)
+        self.assertTrue(encoded)
+        detections = [
+            SimpleNamespace(x_min=80, x_max=180, y_min=80, y_max=200),
+            SimpleNamespace(x_min=345, x_max=365, y_min=240, y_max=270),
+        ]
+
+        circle = find_target_circle(jpeg.tobytes(), detections)
+
+        self.assertAlmostEqual(circle.x_px, 400, delta=3)
+        self.assertAlmostEqual(circle.y_px, 250, delta=3)
+
+    def test_rejects_multiple_circular_candidates(self):
+        image = np.full((480, 640, 3), 35, dtype=np.uint8)
+        cv2.circle(image, (200, 250), 45, (0, 220, 255), -1)
+        cv2.circle(image, (200, 250), 45, (10, 10, 10), 3)
+        cv2.circle(image, (450, 250), 45, (0, 220, 255), -1)
+        cv2.circle(image, (450, 250), 45, (10, 10, 10), 3)
+        encoded, jpeg = cv2.imencode(".jpg", image)
+        self.assertTrue(encoded)
+        detections = [
+            SimpleNamespace(x_min=170, x_max=210, y_min=230, y_max=270),
+            SimpleNamespace(x_min=420, x_max=460, y_min=230, y_max=270),
+        ]
+
+        with self.assertRaisesRegex(DetectionError, "found 2"):
+            find_target_circle(jpeg.tobytes(), detections)
+
+
+class SameFrameCircleLocationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detector_analyzes_the_exact_camera_image(self):
+        config = replace(
+            settings(),
+            target_label="circle-yellow",
+            target_locator="circle-top",
+        )
+        color_image = SimpleNamespace(
+            name="color",
+            data=b"jpeg",
+            width=1280,
+            height=720,
+        )
+        detection = SimpleNamespace(
+            class_name="circle-yellow",
+            x_min=870,
+            x_max=947,
+            y_min=204,
+            y_max=267,
+        )
+        camera = SimpleNamespace(
+            get_images=AsyncMock(return_value=([color_image], SimpleNamespace())),
+            get_properties=AsyncMock(
+                return_value=SimpleNamespace(intrinsic_parameters=SimpleNamespace())
+            ),
+            get_point_cloud=AsyncMock(return_value=(b"pcd", "application/pcd")),
+        )
+        detector = SimpleNamespace(get_detections=AsyncMock(return_value=[detection]))
+        world_top = PoseInFrame(
+            reference_frame="world",
+            pose=Pose(x=400, y=-50, z=40),
+        )
+        camera_center = PoseInFrame(
+            reference_frame=config.camera_name,
+            pose=Pose(x=0, y=0, z=1000),
+        )
+        machine = SimpleNamespace(
+            transform_pose=AsyncMock(side_effect=[world_top, camera_center])
+        )
+
+        with (
+            patch(
+                "robot_app.find_target_circle",
+                return_value=ImageCircle(929, 187, 42),
+            ),
+            patch("robot_app.camera_point_at_circle", return_value=Pose()),
+        ):
+            target = await _locate_circle_target_once(
+                machine,
+                camera,
+                detector,
+                config,
+            )
+
+        self.assertEqual(target.label, "circle-yellow")
+        detector.get_detections.assert_awaited_once_with(
+            color_image,
+            timeout=config.detection_timeout_s,
+        )
 
     def test_projects_circle_depth_points_to_camera_millimeters(self):
         header = (
