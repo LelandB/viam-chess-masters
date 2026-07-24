@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
+import statistics
+import struct
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 from dotenv import load_dotenv
 from grpclib.exceptions import GRPCError, StreamTerminatedError
 from viam.components.arm import Arm
@@ -104,6 +109,8 @@ class Settings:
     home_pose_name: str
     table_name: str
     target_label: str
+    target_locator: str
+    table_top_z_mm: float
     place_x_mm: float
     place_y_mm: float
     place_z_mm: float
@@ -166,6 +173,11 @@ class Settings:
                 "Detection attempts and timeout must be positive; "
                 "retry delay cannot be negative"
             )
+        target_locator = os.getenv("TARGET_LOCATOR", "segments").strip().lower()
+        if target_locator not in {"segments", "circle-top"}:
+            raise ConfigurationError(
+                "TARGET_LOCATOR must be 'segments' or 'circle-top'"
+            )
 
         return cls(
             machine_address=os.environ["MACHINE_ADDRESS"],
@@ -180,6 +192,8 @@ class Settings:
             home_pose_name=os.getenv("HOME_POSE_NAME", "home-pose"),
             table_name=os.getenv("TABLE_NAME", "table"),
             target_label=os.getenv("TARGET_LABEL", "rectangle-green"),
+            target_locator=target_locator,
+            table_top_z_mm=_float_env("TABLE_TOP_Z_MM", 0),
             place_x_mm=_float_env("PLACE_X_MM", 300),
             place_y_mm=_float_env("PLACE_Y_MM", 150),
             # PLACE_Z_MM is the desired object-center height. Motion drives the
@@ -208,6 +222,14 @@ class Target:
     point_cloud_bytes: int
     pose_in_camera: PoseInFrame
     pose_in_world: PoseInFrame
+    inferred_height_mm: float | None = None
+
+
+@dataclass(frozen=True)
+class ImageCircle:
+    x_px: float
+    y_px: float
+    radius_px: float
 
 
 @dataclass(frozen=True)
@@ -342,6 +364,209 @@ async def locate_target(
         point_cloud_bytes=len(getattr(obj, "point_cloud", b"")),
         pose_in_camera=pose_in_camera,
         pose_in_world=pose_in_world,
+    )
+
+
+def find_target_circle(image_bytes: bytes, detection: Any) -> ImageCircle:
+    """Find one circular top near a color-detector candidate."""
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    grayscale = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+    if grayscale is None:
+        raise DetectionError("Could not decode the camera's color image")
+
+    circles = cv2.HoughCircles(
+        cv2.medianBlur(grayscale, 9),
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=80,
+        param1=100,
+        param2=30,
+        minRadius=20,
+        maxRadius=80,
+    )
+    if circles is None:
+        raise DetectionError("No circular top was found near the color candidate")
+
+    candidate_x = (detection.x_min + detection.x_max) / 2
+    candidate_y = (detection.y_min + detection.y_max) / 2
+    nearby = [
+        ImageCircle(float(x), float(y), float(radius))
+        for x, y, radius in circles[0]
+        if math.hypot(x - candidate_x, y - candidate_y) <= radius * 1.5
+    ]
+    if len(nearby) != 1:
+        raise DetectionError(
+            "Expected exactly one circular top near the color candidate; "
+            f"found {len(nearby)}"
+        )
+    return nearby[0]
+
+
+def camera_point_at_circle(
+    point_cloud: bytes,
+    intrinsics: Any,
+    circle: ImageCircle,
+) -> Pose:
+    """Return the robust camera-frame center of the circle's visible top."""
+    separator = b"DATA binary\n"
+    if separator not in point_cloud:
+        raise DetectionError("Camera point cloud is not binary PCD data")
+    header, payload = point_cloud.split(separator, 1)
+    if b"FIELDS x y z rgb" not in header or len(payload) % 16:
+        raise DetectionError("Camera point cloud has an unsupported PCD layout")
+
+    selected: list[tuple[float, float, float]] = []
+    inner_radius = circle.radius_px * 0.65
+    for x_m, y_m, z_m, _ in struct.iter_unpack("<fffI", payload):
+        if not all(math.isfinite(value) for value in (x_m, y_m, z_m)) or z_m <= 0:
+            continue
+        x_px = intrinsics.focal_x_px * x_m / z_m + intrinsics.center_x_px
+        y_px = intrinsics.focal_y_px * y_m / z_m + intrinsics.center_y_px
+        if math.hypot(x_px - circle.x_px, y_px - circle.y_px) <= inner_radius:
+            selected.append((x_m * 1000, y_m * 1000, z_m * 1000))
+
+    if len(selected) < 30:
+        raise DetectionError(
+            "Too few depth points were available inside the circular top: "
+            f"{len(selected)}"
+        )
+
+    median_depth = statistics.median(point[2] for point in selected)
+    depth_filtered = [point for point in selected if abs(point[2] - median_depth) <= 15]
+    if len(depth_filtered) < 20:
+        raise DetectionError("The circular top's depth did not form one stable surface")
+    return Pose(
+        x=statistics.median(point[0] for point in depth_filtered),
+        y=statistics.median(point[1] for point in depth_filtered),
+        z=statistics.median(point[2] for point in depth_filtered),
+    )
+
+
+def cylinder_center_from_top(
+    top_world: PoseInFrame, table_top_z_mm: float
+) -> tuple[PoseInFrame, float]:
+    """Infer an upright cylinder's center from its top and the table plane."""
+    height = top_world.pose.z - table_top_z_mm
+    if not 5 <= height <= 200:
+        raise DetectionError(
+            "Inferred cylinder height is implausible: "
+            f"top z={top_world.pose.z:.1f} mm, table z={table_top_z_mm:.1f} mm"
+        )
+    center = _world_pose(
+        _pose_at(
+            top_world.pose.x,
+            top_world.pose.y,
+            table_top_z_mm + height / 2,
+            top_world.pose,
+        )
+    )
+    return center, height
+
+
+async def _locate_circle_target_once(
+    machine: RobotClient,
+    camera: Camera,
+    detector: VisionClient,
+    settings: Settings,
+) -> Target:
+    detections = await detector.get_detections_from_camera(
+        settings.camera_name,
+        timeout=settings.detection_timeout_s,
+    )
+    matches = [
+        detection
+        for detection in detections
+        if fnmatchcase(detection.class_name, settings.target_label)
+    ]
+    if len(matches) != 1:
+        labels = ", ".join(d.class_name for d in detections) or "none"
+        raise DetectionError(
+            f"Expected exactly one 2D candidate matching {settings.target_label!r}; "
+            f"found {len(matches)}. Observed labels: {labels}"
+        )
+
+    images, _ = await camera.get_images(
+        filter_source_names=["color"],
+        timeout=settings.detection_timeout_s,
+    )
+    color_images = [image for image in images if image.name == "color"]
+    if len(color_images) != 1:
+        raise DetectionError(
+            f"Expected one color image from {settings.camera_name}; "
+            f"found {len(color_images)}"
+        )
+    circle = find_target_circle(color_images[0].data, matches[0])
+
+    properties = await camera.get_properties(timeout=settings.rpc_timeout_s)
+    intrinsics = properties.intrinsic_parameters
+    if intrinsics is None:
+        raise DetectionError("camera-1 has no intrinsic parameters")
+    point_cloud, _ = await camera.get_point_cloud(timeout=settings.detection_timeout_s)
+    top_camera_pose = PoseInFrame(
+        reference_frame=settings.camera_name,
+        pose=camera_point_at_circle(point_cloud, intrinsics, circle),
+    )
+    top_world_pose = await machine.transform_pose(top_camera_pose, "world")
+    center_world, height = cylinder_center_from_top(
+        top_world_pose,
+        settings.table_top_z_mm,
+    )
+    require_in_workspace("Detected cylinder", center_world.pose, settings.workspace)
+    center_camera = await machine.transform_pose(center_world, settings.camera_name)
+    return Target(
+        label=matches[0].class_name,
+        point_cloud_bytes=len(point_cloud),
+        pose_in_camera=center_camera,
+        pose_in_world=center_world,
+        inferred_height_mm=height,
+    )
+
+
+async def locate_circle_target(
+    machine: RobotClient,
+    camera: Camera,
+    detector: VisionClient,
+    settings: Settings,
+) -> Target:
+    last_error: DetectionError | None = None
+    for attempt in range(1, settings.detection_attempts + 1):
+        try:
+            return await _locate_circle_target_once(
+                machine,
+                camera,
+                detector,
+                settings,
+            )
+        except DetectionError as exc:
+            last_error = exc
+            if attempt == settings.detection_attempts:
+                break
+            print(
+                f"Circle localization attempt {attempt}/"
+                f"{settings.detection_attempts} failed: {exc}; retrying"
+            )
+            await asyncio.sleep(settings.detection_retry_delay_s)
+    raise DetectionError(
+        f"Circle target did not stabilize after {settings.detection_attempts} "
+        f"attempts. Last result: {last_error}"
+    )
+
+
+async def locate_configured_target(
+    machine: RobotClient,
+    settings: Settings,
+) -> Target:
+    if settings.target_locator == "circle-top":
+        return await locate_circle_target(
+            machine,
+            Camera.from_robot(machine, settings.camera_name),
+            VisionClient.from_robot(machine, settings.detector_name),
+            settings,
+        )
+    return await locate_target(
+        machine,
+        VisionClient.from_robot(machine, settings.segmenter_name),
+        settings,
     )
 
 
@@ -521,12 +746,13 @@ async def doctor(machine: RobotClient, settings: Settings) -> None:
 
 
 async def detect(machine: RobotClient, settings: Settings) -> Target:
-    vision = VisionClient.from_robot(machine, settings.segmenter_name)
-    target = await locate_target(machine, vision, settings)
+    target = await locate_configured_target(machine, settings)
     print(
         f"Detected {target.label!r}; point-cloud payload "
         f"{target.point_cloud_bytes} bytes"
     )
+    if target.inferred_height_mm is not None:
+        print(f"inferred upright-cylinder height: {target.inferred_height_mm:.1f} mm")
     print(f"camera pose: {format_pose(target.pose_in_camera)}")
     print(f"world pose:  {format_pose(target.pose_in_world)}")
     return target
@@ -548,7 +774,6 @@ async def pick_place(
     gripper = Gripper.from_robot(machine, settings.gripper_name)
     home = Switch.from_robot(machine, settings.home_pose_name)
     motion = MotionClient.from_robot(machine, settings.motion_name)
-    vision = VisionClient.from_robot(machine, settings.segmenter_name)
     stage = "execution preflight"
 
     try:
@@ -574,7 +799,7 @@ async def pick_place(
             f"Execution stage: {stage} (timeout {settings.detection_timeout_s:.0f}s)",
             flush=True,
         )
-        target = await locate_target(machine, vision, settings)
+        target = await locate_configured_target(machine, settings)
         gripper_world = await motion.get_pose(
             settings.gripper_name,
             "world",
@@ -595,6 +820,11 @@ async def pick_place(
             f"Target object center: {format_pose(target.pose_in_world)}",
             flush=True,
         )
+        if target.inferred_height_mm is not None:
+            print(
+                f"Inferred upright-cylinder height: {target.inferred_height_mm:.1f} mm",
+                flush=True,
+            )
         for name, pose in plan.steps():
             print(f"- {name}: {format_pose(pose)}", flush=True)
         if not execute:
@@ -723,9 +953,32 @@ async def move_home(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("doctor", help="Run read-only resource and frame checks")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Run read-only resource and frame checks"
+    )
+    doctor_parser.add_argument(
+        "--detector-name",
+        help="Override DETECTOR_NAME for this run",
+    )
+    doctor_parser.add_argument(
+        "--segmenter-name",
+        help="Override SEGMENTER_NAME for this run",
+    )
     detect = subparsers.add_parser(
         "detect", help="Locate one target in camera and world frames"
+    )
+    detect.add_argument(
+        "--segmenter-name",
+        help="Override SEGMENTER_NAME for this run",
+    )
+    detect.add_argument(
+        "--detector-name",
+        help="Override DETECTOR_NAME for this run",
+    )
+    detect.add_argument(
+        "--target-locator",
+        choices=("segments", "circle-top"),
+        help="Use 3D segments or an SDK-localized circular top",
     )
     detect.add_argument(
         "--target-label",
@@ -766,15 +1019,37 @@ def build_parser() -> argparse.ArgumentParser:
             "'circle-*', '*-blue', or '*'"
         ),
     )
+    pick.add_argument(
+        "--segmenter-name",
+        help="Override SEGMENTER_NAME for this run",
+    )
+    pick.add_argument(
+        "--detector-name",
+        help="Override DETECTOR_NAME for this run",
+    )
+    pick.add_argument(
+        "--target-locator",
+        choices=("segments", "circle-top"),
+        help="Use 3D segments or an SDK-localized circular top",
+    )
     subparsers.add_parser("stop", help="Immediately request that arm-1 stop")
     return parser
 
 
 async def async_main(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
-    target_label = getattr(args, "target_label", None)
-    if target_label:
-        settings = replace(settings, target_label=target_label)
+    overrides = {
+        name: value
+        for name in (
+            "target_label",
+            "target_locator",
+            "detector_name",
+            "segmenter_name",
+        )
+        if (value := getattr(args, name, None))
+    }
+    if overrides:
+        settings = replace(settings, **overrides)
     machine = await connect(settings)
     try:
         if args.command == "doctor":

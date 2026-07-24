@@ -5,6 +5,7 @@ description = "Starter and reference scripts for the Viam vision-guided pick-and
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "opencv-python-headless>=4.10",
     "python-dotenv>=1.0",
     "viam-sdk>=0.20",
 ]

@@ -1,21 +1,29 @@
 """Unit tests for the no-hardware planning and safety logic."""
 
 import os
+import struct
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import cv2
+import numpy as np
 from viam.proto.common import Pose, PoseInFrame
 
 from robot_app import (
     ConfigurationError,
     DetectionError,
+    ImageCircle,
     Settings,
     WorkspaceBounds,
+    build_parser,
     build_plan,
+    camera_point_at_circle,
     connect,
+    cylinder_center_from_top,
     doctor,
+    find_target_circle,
     locate_target,
     move_home,
     select_target_geometry,
@@ -45,6 +53,8 @@ def settings() -> Settings:
         home_pose_name="home-pose",
         table_name="table",
         target_label="rectangle-green",
+        target_locator="segments",
+        table_top_z_mm=0,
         place_x_mm=300,
         place_y_mm=150,
         place_z_mm=10,
@@ -124,6 +134,95 @@ class TargetSelectionTests(unittest.TestCase):
             "*",
         )
         self.assertEqual(geometry.label, "triangle-blue")
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_detect_accepts_alternate_segmenter_and_label(self):
+        args = build_parser().parse_args(
+            [
+                "detect",
+                "--detector-name",
+                "yellow-cylinder-detector",
+                "--segmenter-name",
+                "yellow-cylinder-segment",
+                "--target-label",
+                "circle-yellow",
+                "--target-locator",
+                "circle-top",
+            ]
+        )
+
+        self.assertEqual(args.segmenter_name, "yellow-cylinder-segment")
+        self.assertEqual(args.detector_name, "yellow-cylinder-detector")
+        self.assertEqual(args.target_label, "circle-yellow")
+        self.assertEqual(args.target_locator, "circle-top")
+
+    def test_doctor_accepts_alternate_vision_pipeline(self):
+        args = build_parser().parse_args(
+            [
+                "doctor",
+                "--detector-name",
+                "yellow-cylinder-detector",
+                "--segmenter-name",
+                "yellow-cylinder-segment",
+            ]
+        )
+
+        self.assertEqual(args.detector_name, "yellow-cylinder-detector")
+        self.assertEqual(args.segmenter_name, "yellow-cylinder-segment")
+
+
+class CircleLocalizationTests(unittest.TestCase):
+    def test_finds_one_circle_near_color_candidate(self):
+        image = np.full((480, 640, 3), 35, dtype=np.uint8)
+        cv2.circle(image, (400, 250), 45, (0, 220, 255), -1)
+        cv2.circle(image, (400, 250), 45, (10, 10, 10), 3)
+        encoded, jpeg = cv2.imencode(".jpg", image)
+        self.assertTrue(encoded)
+        detection = SimpleNamespace(x_min=345, x_max=365, y_min=240, y_max=270)
+
+        circle = find_target_circle(jpeg.tobytes(), detection)
+
+        self.assertAlmostEqual(circle.x_px, 400, delta=3)
+        self.assertAlmostEqual(circle.y_px, 250, delta=3)
+        self.assertAlmostEqual(circle.radius_px, 45, delta=4)
+
+    def test_projects_circle_depth_points_to_camera_millimeters(self):
+        header = (
+            b"VERSION .7\nFIELDS x y z rgb\nSIZE 4 4 4 4\n"
+            b"TYPE F F F I\nCOUNT 1 1 1 1\nWIDTH 40\nHEIGHT 1\n"
+            b"POINTS 40\nDATA binary\n"
+        )
+        payload = header + b"".join(
+            struct.pack("<fffI", 0.1, 0.2, 1.0, 0xFFFF00) for _ in range(40)
+        )
+        intrinsics = SimpleNamespace(
+            focal_x_px=100,
+            focal_y_px=100,
+            center_x_px=0,
+            center_y_px=0,
+        )
+
+        pose = camera_point_at_circle(
+            payload,
+            intrinsics,
+            ImageCircle(x_px=10, y_px=20, radius_px=10),
+        )
+
+        self.assertAlmostEqual(pose.x, 100, places=3)
+        self.assertAlmostEqual(pose.y, 200, places=3)
+        self.assertAlmostEqual(pose.z, 1000, places=3)
+
+    def test_infers_cylinder_center_between_table_and_top(self):
+        center, height = cylinder_center_from_top(
+            PoseInFrame(reference_frame="world", pose=Pose(x=400, y=-50, z=40)),
+            table_top_z_mm=0,
+        )
+
+        self.assertEqual(height, 40)
+        self.assertEqual(center.pose.x, 400)
+        self.assertEqual(center.pose.y, -50)
+        self.assertEqual(center.pose.z, 20)
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):

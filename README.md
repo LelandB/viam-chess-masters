@@ -12,6 +12,8 @@ custom service to `viam-server`.
 ```text
 camera-1 -> shape-detector -> vision-segment -> Python SDK
          -> world-frame target -> builtin Motion -> arm-1 + gripper-1
+
+camera-1 -> yellow-cylinder-detector -> SDK circle/top-depth locator -> Python SDK
 ```
 
 Required resources:
@@ -23,6 +25,8 @@ Required resources:
 - `table` with its world-frame collision geometry
 - `shape-detector`
 - `vision-segment`
+- `yellow-cylinder-detector` and `yellow-cylinder-segment` for the upright
+  yellow cylinder
 - the built-in Motion service, named `builtin`
 
 `module-reference.py` is retained only as workshop history. It is not part of
@@ -134,6 +138,70 @@ The live shape detector uses fixed HSV thresholds. Reflections can make a block
 briefly appear under a neighboring color label, so `detect` retries a bounded
 number of times until the requested selector yields exactly one target. It still
 fails closed if the requested target is missing or ambiguous.
+
+### Yellow upright cylinder
+
+The four-sided `shape-detector` cannot detect circles. The machine therefore
+keeps the rectangle pipeline intact and adds a dedicated Viam
+`vision/color_detector` named `yellow-cylinder-detector`. Its saved HSV settings
+isolate a saturated patch on the yellow cylinder and label it `circle-yellow`.
+The SDK then confirms exactly one circular top in the camera image, projects the
+circle's interior through the RealSense point cloud, and infers the upright
+cylinder center halfway between its observed top and `TABLE_TOP_Z_MM`.
+
+`yellow-cylinder-segment` remains available for Viam-side 3D diagnostics, but
+the physical plan uses the circle/top-depth locator because a rectangular color
+bounding box can include the table or land on one side of the cylinder.
+
+The label is a controlled alias for this workcell, not general shape
+classification. If another large saturated-yellow object enters the view, the
+application will fail closed unless exactly one `circle-yellow` candidate and
+one nearby circular top are present.
+
+The saved `yellow-cylinder-detector` calibration is:
+
+```json
+{
+  "segment_size_px": 300,
+  "hue_tolerance_pct": 0.018,
+  "saturation_cutoff_pct": 0.75,
+  "value_cutoff_pct": 0.2,
+  "detect_color": "#FFDE00",
+  "label": "circle-yellow",
+  "camera_name": "camera-1"
+}
+```
+
+Keep the full cylinder inside the calibrated camera view. Partial yellow
+objects at an image edge are rejected before 3D planning.
+
+Check the alternate detector and segmenter without changing `.env`:
+
+```bash
+uv run python robot_app.py doctor \
+  --detector-name yellow-cylinder-detector \
+  --segmenter-name yellow-cylinder-segment
+```
+
+Localize the cylinder, then print its complete no-motion plan:
+
+```bash
+uv run python robot_app.py detect \
+  --target-locator circle-top \
+  --detector-name yellow-cylinder-detector \
+  --segmenter-name yellow-cylinder-segment \
+  --target-label circle-yellow
+
+uv run python robot_app.py pick-place \
+  --target-locator circle-top \
+  --detector-name yellow-cylinder-detector \
+  --segmenter-name yellow-cylinder-segment \
+  --target-label circle-yellow
+```
+
+Do not add `--execute` until the taller cylinder's printed object center,
+gripper-frame grasp height, and jaw contact point have been physically checked.
+The rectangle calibration does not prove a safe cylinder grasp.
 
 The SDK client disables its background connection probe because transferring a
 RealSense point cloud can take longer than the probe interval on this machine.
