@@ -35,11 +35,13 @@ failed Hugging Face service, the black/white detector, obsolete ML model
 services, unused YOLO and TensorFlow Lite modules, and leftover chess model
 packages were removed. Viam configuration history remains the rollback surface.
 
-The Viam test panel returned labeled 2D detections and 3D boxes in the
-`camera-1` frame. A later SDK preflight found saved/live configuration drift:
-the saved configuration must restore `gripper-1`, add `table` to the frame
-system, and remove an orphan registry module before the verification ladder can
-pass. No arm or gripper motion was executed during verification.
+The Viam test panel and SDK return labeled 2D detections and 3D boxes in the
+`camera-1` frame. The saved configuration now includes `gripper-1`, a `table`
+frame and collision geometry whose top is world `z=0`, and the required vision
+services. The first enabled cycle reached the pre-grasp waypoint, but the motion
+planner blocked its grasp descent because the old code placed the gripper frame
+at the object center, intersecting the modeled claws with the table. The plan
+now applies the measured claw-to-frame offset.
 
 ## Security setup
 
@@ -63,7 +65,9 @@ these values against the physical workcell before approving calibration:
 ```dotenv
 PLACE_X_MM=300
 PLACE_Y_MM=150
-PLACE_Z_MM=5
+PLACE_Z_MM=10
+GRASP_Z_OFFSET_MM=55
+PLACE_Z_OFFSET_MM=55
 ```
 
 The `.env` file is ignored by Git.
@@ -112,12 +116,24 @@ Print the complete pick/place plan without sending arm or gripper commands:
 uv run python robot_app.py pick-place
 ```
 
+If a failed cycle leaves the wrist camera away from the calibrated viewing
+pose, move only to the configured home pose before detecting again:
+
+```bash
+CALIBRATION_APPROVED=true uv run python robot_app.py home \
+  --confirm-physical-motion
+```
+
+This command does not detect, grasp, or continue into a pick/place cycle.
+
 ## Physical execution gate
 
 Before physical execution, verify these in Viam's 3D Scene:
 
 1. `camera-1` is aligned with its depth point cloud.
-2. `gripper-1` origin is the actual jaw-tip TCP.
+2. `gripper-1` geometry matches the real tool. On this machine the modeled
+   claws extend about 54.7 mm below the gripper frame, so pickup and placement
+   apply a 55 mm frame offset instead of treating the object center as the TCP.
 3. The table top and collision geometry align with the real table.
 4. `PLACE_X_MM`, `PLACE_Y_MM`, and `PLACE_Z_MM` identify the desired drop
    location in the world frame.
@@ -126,11 +142,11 @@ Before physical execution, verify these in Viam's 3D Scene:
 6. `GRASP_Z_OFFSET_MM` and `PLACE_Z_OFFSET_MM` account for the TCP, block height,
    and placement surface.
 
-Then set `CALIBRATION_APPROVED=true` in `.env`. With the work area clear, an
-operator at the emergency stop, and everyone warned, run exactly one cycle:
+With the work area clear, an operator at the emergency stop, and everyone
+warned, approve calibration for exactly one process and run one cycle:
 
 ```bash
-uv run python robot_app.py pick-place \
+CALIBRATION_APPROVED=true uv run python robot_app.py pick-place \
   --execute \
   --confirm-physical-motion
 ```

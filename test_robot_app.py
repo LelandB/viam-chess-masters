@@ -17,6 +17,7 @@ from robot_app import (
     connect,
     doctor,
     locate_target,
+    move_home,
     select_target_geometry,
     validate_execution_request,
 )
@@ -46,13 +47,13 @@ def settings() -> Settings:
         target_label="rectangle-green",
         place_x_mm=300,
         place_y_mm=150,
-        place_z_mm=5,
+        place_z_mm=10,
         detection_attempts=6,
         detection_retry_delay_s=0.5,
         approach_clearance_mm=100,
-        grasp_z_offset_mm=5,
+        grasp_z_offset_mm=55,
         lift_clearance_mm=150,
-        place_z_offset_mm=10,
+        place_z_offset_mm=55,
         rpc_timeout_s=30,
         settle_s=0.5,
         calibration_approved=False,
@@ -146,13 +147,14 @@ class PlanTests(unittest.TestCase):
             reference_frame="world",
             pose=Pose(o_x=0, o_y=0, o_z=-1, theta=0),
         )
-        marker = PoseInFrame(reference_frame="world", pose=Pose(x=300, y=150, z=-10))
+        marker = PoseInFrame(reference_frame="world", pose=Pose(x=300, y=150, z=10))
         plan = build_plan(target, gripper, marker, config)
 
-        self.assertEqual(plan.grasp.pose.z, 25)
-        self.assertEqual(plan.pre_grasp.pose.z, 125)
-        self.assertEqual(plan.lift.pose.z, 175)
-        self.assertEqual(plan.place.pose.z, 0)
+        self.assertEqual(plan.grasp.pose.z, 75)
+        self.assertEqual(plan.pre_grasp.pose.z, 175)
+        self.assertEqual(plan.lift.pose.z, 225)
+        self.assertEqual(plan.place.pose.z, 65)
+        self.assertEqual(plan.pre_place.pose.z, 165)
         self.assertEqual(plan.retreat.pose.x, plan.place.pose.x)
         self.assertEqual(plan.retreat.pose.y, plan.place.pose.y)
         self.assertEqual(plan.retreat.reference_frame, "world")
@@ -213,6 +215,18 @@ class SafetyGateTests(unittest.TestCase):
             self.assertRaises(ConfigurationError),
         ):
             Settings.from_env()
+
+
+class HomeCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_home_requires_confirmation_before_resolving_resources(self):
+        machine = SimpleNamespace()
+
+        with self.assertRaises(ConfigurationError):
+            await move_home(
+                machine,
+                settings(),
+                confirmed_physical_motion=False,
+            )
 
 
 if __name__ == "__main__":

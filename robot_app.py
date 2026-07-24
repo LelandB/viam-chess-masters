@@ -1,6 +1,6 @@
 """Safe Viam SDK app for detecting and moving one green rectangular block.
 
-Commands are read-only unless ``pick-place --execute`` or ``stop`` is used.
+Commands are read-only unless ``home``, ``pick-place --execute``, or ``stop`` is used.
 Physical pick-and-place additionally requires ``--confirm-physical-motion``
 and ``CALIBRATION_APPROVED=true``.
 """
@@ -174,13 +174,18 @@ class Settings:
             target_label=os.getenv("TARGET_LABEL", "rectangle-green"),
             place_x_mm=_float_env("PLACE_X_MM", 300),
             place_y_mm=_float_env("PLACE_Y_MM", 150),
-            place_z_mm=_float_env("PLACE_Z_MM", 5),
+            # PLACE_Z_MM is the desired object-center height. Motion drives the
+            # gripper frame, so the calibrated tool offset is added below.
+            place_z_mm=_float_env("PLACE_Z_MM", 10),
             detection_attempts=detection_attempts,
             detection_retry_delay_s=detection_retry_delay,
             approach_clearance_mm=approach,
-            grasp_z_offset_mm=_float_env("GRASP_Z_OFFSET_MM", 0),
+            # The live gripper's claw collision box reaches about 54.7 mm below
+            # its frame. A 55 mm offset keeps the frame target distinct from the
+            # detected object's center and prevents a table intersection.
+            grasp_z_offset_mm=_float_env("GRASP_Z_OFFSET_MM", 55),
             lift_clearance_mm=lift,
-            place_z_offset_mm=_float_env("PLACE_Z_OFFSET_MM", 0),
+            place_z_offset_mm=_float_env("PLACE_Z_OFFSET_MM", 55),
             rpc_timeout_s=timeout,
             settle_s=settle,
             calibration_approved=_bool_env("CALIBRATION_APPROVED", False),
@@ -339,6 +344,8 @@ def build_plan(
     target = target_world.pose
     marker = place_marker_world.pose
     orientation = gripper_world.pose
+    # Vision localizes the center of the object. Motion.move drives the named
+    # gripper frame, which sits above the bottom of the claws on this tool.
     grasp_z = target.z + settings.grasp_z_offset_mm
     place_z = marker.z + settings.place_z_offset_mm
 
@@ -488,7 +495,16 @@ async def doctor(machine: RobotClient, settings: Settings) -> None:
     print(f"home switch position: {home_position}")
     print(f"gripper moving: {gripper_moving}; holding status: {holding}")
     print(f"gripper pose: {format_pose(gripper_world)}")
-    print(f"configured place pose: {format_pose(place_world)}")
+    place_gripper_world = _world_pose(
+        _pose_at(
+            place_world.pose.x,
+            place_world.pose.y,
+            place_world.pose.z + settings.place_z_offset_mm,
+            gripper_world.pose,
+        )
+    )
+    print(f"configured place object center: {format_pose(place_world)}")
+    print(f"configured place gripper frame: {format_pose(place_gripper_world)}")
     if not camera_properties.supports_pcd:
         raise ConfigurationError("camera-1 must support point clouds")
     print("Doctor checks passed")
@@ -556,6 +572,7 @@ async def pick_place(
         plan = build_plan(target.pose_in_world, gripper_world, place_world, settings)
 
         print(f"Target: {target.label!r}")
+        print(f"Target object center: {format_pose(target.pose_in_world)}")
         for name, pose in plan.steps():
             print(f"- {name}: {format_pose(pose)}")
         if not execute:
@@ -634,11 +651,43 @@ async def stop(machine: RobotClient, settings: Settings) -> None:
     print(f"Stop sent to {settings.arm_name}")
 
 
+async def move_home(
+    machine: RobotClient,
+    settings: Settings,
+    *,
+    confirmed_physical_motion: bool,
+) -> None:
+    """Move only to the configured observation/home pose."""
+    validate_execution_request(
+        True,
+        confirmed_physical_motion,
+        settings.calibration_approved,
+    )
+    arm = Arm.from_robot(machine, settings.arm_name)
+    home = Switch.from_robot(machine, settings.home_pose_name)
+    try:
+        await home.set_position(2, timeout=settings.rpc_timeout_s)
+        print(f"Moved {settings.arm_name} to {settings.home_pose_name} position 2")
+    except Exception:
+        await arm.stop(timeout=settings.rpc_timeout_s)
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="Run read-only resource and frame checks")
     subparsers.add_parser("detect", help="Locate one target in camera and world frames")
+
+    home = subparsers.add_parser(
+        "home",
+        help="Move only to the configured observation/home pose",
+    )
+    home.add_argument(
+        "--confirm-physical-motion",
+        action="store_true",
+        help="Acknowledge that the command can move the real arm",
+    )
 
     pick = subparsers.add_parser(
         "pick-place",
@@ -666,6 +715,12 @@ async def async_main(args: argparse.Namespace) -> None:
             await doctor(machine, settings)
         elif args.command == "detect":
             await detect(machine, settings)
+        elif args.command == "home":
+            await move_home(
+                machine,
+                settings,
+                confirmed_physical_motion=args.confirm_physical_motion,
+            )
         elif args.command == "pick-place":
             await pick_place(
                 machine,
