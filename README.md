@@ -63,7 +63,7 @@ these values against the physical workcell before approving calibration:
 ```dotenv
 PLACE_X_MM=300
 PLACE_Y_MM=150
-PLACE_Z_MM=-10
+PLACE_Z_MM=5
 ```
 
 The `.env` file is ignored by Git.
@@ -101,6 +101,10 @@ The live shape detector uses fixed HSV thresholds. Reflections can make a block
 briefly appear under a neighboring color label, so `detect` retries a bounded
 number of times for the exact `TARGET_LABEL`. It still fails closed if the
 requested target is missing or ambiguous.
+
+The SDK client disables its background connection probe because transferring a
+RealSense point cloud can take longer than the probe interval on this machine.
+Each operation remains bounded by `RPC_TIMEOUT_S`.
 
 Print the complete pick/place plan without sending arm or gripper commands:
 

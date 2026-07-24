@@ -14,6 +14,7 @@ from robot_app import (
     Settings,
     WorkspaceBounds,
     build_plan,
+    connect,
     doctor,
     locate_target,
     select_target_geometry,
@@ -32,7 +33,7 @@ def fake_object(label: str, x: float = 300, y: float = 0, z: float = 25):
 def settings() -> Settings:
     return Settings(
         machine_address="example.viam.cloud",
-        api_key_id="id",
+        api_key_id="00000000-0000-0000-0000-000000000001",
         api_key="secret",
         arm_name="arm-1",
         camera_name="camera-1",
@@ -45,7 +46,7 @@ def settings() -> Settings:
         target_label="rectangle-green",
         place_x_mm=300,
         place_y_mm=150,
-        place_z_mm=-10,
+        place_z_mm=5,
         detection_attempts=6,
         detection_retry_delay_s=0.5,
         approach_clearance_mm=100,
@@ -78,6 +79,16 @@ class TargetSelectionTests(unittest.TestCase):
     def test_rejects_missing_target(self):
         with self.assertRaises(DetectionError):
             select_target_geometry([fake_object("rectangle-blue")], "rectangle-green")
+
+
+class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disables_background_probe_for_large_point_cloud_rpc(self):
+        with patch("robot_app.RobotClient.at_address", new=AsyncMock()) as at_address:
+            await connect(settings())
+
+        options = at_address.await_args.args[1]
+        self.assertEqual(options.check_connection_interval, 0)
+        self.assertEqual(options.attempt_reconnect_interval, 0)
 
 
 class TargetLocationTests(unittest.IsolatedAsyncioTestCase):

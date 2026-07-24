@@ -174,7 +174,7 @@ class Settings:
             target_label=os.getenv("TARGET_LABEL", "rectangle-green"),
             place_x_mm=_float_env("PLACE_X_MM", 300),
             place_y_mm=_float_env("PLACE_Y_MM", 150),
-            place_z_mm=_float_env("PLACE_Z_MM", -10),
+            place_z_mm=_float_env("PLACE_Z_MM", 5),
             detection_attempts=detection_attempts,
             detection_retry_delay_s=detection_retry_delay,
             approach_clearance_mm=approach,
@@ -220,6 +220,12 @@ async def connect(settings: Settings) -> RobotClient:
     options = RobotClient.Options.with_api_key(
         api_key=settings.api_key,
         api_key_id=settings.api_key_id,
+        # Point-cloud responses can take longer than the SDK's default 10-second
+        # background connection check. On a single busy channel that probe can
+        # time out and terminate an otherwise healthy large RPC. These commands
+        # are short-lived and every RPC already has an explicit timeout.
+        check_connection_interval=0,
+        attempt_reconnect_interval=0,
     )
     return await RobotClient.at_address(settings.machine_address, options)
 
