@@ -2,9 +2,10 @@
 name = "viam-pick-and-place"
 version = "0.1.0"
 description = "Starter and reference scripts for the Viam vision-guided pick-and-place workshop."
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "python-dotenv>=1.0",
     "viam-sdk>=0.20",
 ]
 
