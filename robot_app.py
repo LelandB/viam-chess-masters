@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from grpclib.exceptions import GRPCError, StreamTerminatedError
 from viam.components.arm import Arm
 from viam.components.camera import Camera
 from viam.components.gripper import Gripper
@@ -100,9 +101,11 @@ class Settings:
     segmenter_name: str
     motion_name: str
     home_pose_name: str
-    place_marker_name: str
     table_name: str
     target_label: str
+    place_x_mm: float
+    place_y_mm: float
+    place_z_mm: float
     detection_attempts: int
     detection_retry_delay_s: float
     approach_clearance_mm: float
@@ -167,9 +170,11 @@ class Settings:
             segmenter_name=os.getenv("SEGMENTER_NAME", "vision-segment"),
             motion_name=os.getenv("MOTION_NAME", "builtin"),
             home_pose_name=os.getenv("HOME_POSE_NAME", "home-pose"),
-            place_marker_name=os.getenv("PLACE_MARKER_NAME", "place-marker"),
             table_name=os.getenv("TABLE_NAME", "table"),
             target_label=os.getenv("TARGET_LABEL", "rectangle-green"),
+            place_x_mm=_float_env("PLACE_X_MM", 300),
+            place_y_mm=_float_env("PLACE_Y_MM", 150),
+            place_z_mm=_float_env("PLACE_Z_MM", -10),
             detection_attempts=detection_attempts,
             detection_retry_delay_s=detection_retry_delay,
             approach_clearance_mm=approach,
@@ -420,13 +425,28 @@ async def doctor(machine: RobotClient, settings: Settings) -> None:
         settings.detector_name,
         settings.segmenter_name,
         settings.home_pose_name,
-        settings.place_marker_name,
         settings.table_name,
     }
     missing = sorted(required.difference(resources))
     print(f"Connected to {settings.machine_address} ({len(resources)} resources)")
     if missing:
         raise ConfigurationError("Missing live resources: " + ", ".join(missing))
+
+    frame_configs = await machine.get_frame_system_config()
+    frames = {config.frame.reference_frame for config in frame_configs}
+    required_frames = {
+        settings.arm_name,
+        settings.camera_name,
+        settings.gripper_name,
+        settings.table_name,
+    }
+    missing_frames = sorted(required_frames.difference(frames))
+    if missing_frames:
+        raise ConfigurationError(
+            "Resources missing from the live frame system: "
+            + ", ".join(missing_frames)
+            + ". Add a Frame configuration that connects each one to world."
+        )
 
     camera = Camera.from_robot(machine, settings.camera_name)
     detector = VisionClient.from_robot(machine, settings.detector_name)
@@ -448,10 +468,12 @@ async def doctor(machine: RobotClient, settings: Settings) -> None:
         "world",
         timeout=settings.rpc_timeout_s,
     )
-    place_world = await motion.get_pose(
-        settings.place_marker_name,
-        "world",
-        timeout=settings.rpc_timeout_s,
+    place_world = _world_pose(
+        Pose(
+            x=settings.place_x_mm,
+            y=settings.place_y_mm,
+            z=settings.place_z_mm,
+        )
     )
 
     print(f"camera supports point clouds: {camera_properties.supports_pcd}")
@@ -460,7 +482,7 @@ async def doctor(machine: RobotClient, settings: Settings) -> None:
     print(f"home switch position: {home_position}")
     print(f"gripper moving: {gripper_moving}; holding status: {holding}")
     print(f"gripper pose: {format_pose(gripper_world)}")
-    print(f"place marker: {format_pose(place_world)}")
+    print(f"configured place pose: {format_pose(place_world)}")
     if not camera_properties.supports_pcd:
         raise ConfigurationError("camera-1 must support point clouds")
     print("Doctor checks passed")
@@ -517,17 +539,15 @@ async def pick_place(
             "world",
             timeout=settings.rpc_timeout_s,
         )
-        place_marker_world = await motion.get_pose(
-            settings.place_marker_name,
-            "world",
-            timeout=settings.rpc_timeout_s,
+        place_world = _world_pose(
+            Pose(
+                x=settings.place_x_mm,
+                y=settings.place_y_mm,
+                z=settings.place_z_mm,
+            )
         )
-        require_in_workspace(
-            "Place marker", place_marker_world.pose, settings.workspace
-        )
-        plan = build_plan(
-            target.pose_in_world, gripper_world, place_marker_world, settings
-        )
+        require_in_workspace("Place pose", place_world.pose, settings.workspace)
+        plan = build_plan(target.pose_in_world, gripper_world, place_world, settings)
 
         print(f"Target: {target.label!r}")
         for name, pose in plan.steps():
@@ -659,6 +679,8 @@ def main() -> None:
         asyncio.run(async_main(args))
     except (ConfigurationError, DetectionError, RobotMotionError) as exc:
         raise SystemExit(f"Blocked: {exc}") from None
+    except (GRPCError, StreamTerminatedError, TimeoutError) as exc:
+        raise SystemExit(f"Blocked: Viam SDK connection or RPC failed: {exc}") from None
 
 
 if __name__ == "__main__":

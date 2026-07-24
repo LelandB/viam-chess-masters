@@ -14,6 +14,7 @@ from robot_app import (
     Settings,
     WorkspaceBounds,
     build_plan,
+    doctor,
     locate_target,
     select_target_geometry,
     validate_execution_request,
@@ -40,9 +41,11 @@ def settings() -> Settings:
         segmenter_name="vision-segment",
         motion_name="builtin",
         home_pose_name="home-pose",
-        place_marker_name="place-marker",
         table_name="table",
         target_label="rectangle-green",
+        place_x_mm=300,
+        place_y_mm=150,
+        place_z_mm=-10,
         detection_attempts=6,
         detection_retry_delay_s=0.5,
         approach_clearance_mm=100,
@@ -151,6 +154,36 @@ class PlanTests(unittest.TestCase):
             build_plan(target, origin, origin, config)
 
 
+class DoctorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_required_resource_without_frame(self):
+        config = settings()
+        resource_names = {
+            config.arm_name,
+            config.camera_name,
+            config.gripper_name,
+            config.detector_name,
+            config.segmenter_name,
+            config.home_pose_name,
+            config.table_name,
+        }
+        machine = SimpleNamespace(
+            resource_names=[SimpleNamespace(name=name) for name in resource_names],
+            get_frame_system_config=AsyncMock(
+                return_value=[
+                    SimpleNamespace(frame=SimpleNamespace(reference_frame=frame_name))
+                    for frame_name in (
+                        config.arm_name,
+                        config.camera_name,
+                        config.gripper_name,
+                    )
+                ]
+            ),
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "table"):
+            await doctor(machine, config)
+
+
 class SafetyGateTests(unittest.TestCase):
     def test_dry_run_needs_no_motion_confirmation(self):
         validate_execution_request(False, False, False)
@@ -165,6 +198,7 @@ class SafetyGateTests(unittest.TestCase):
     def test_environment_requires_credentials(self):
         with (
             patch.dict(os.environ, {}, clear=True),
+            patch("robot_app.load_dotenv"),
             self.assertRaises(ConfigurationError),
         ):
             Settings.from_env()
