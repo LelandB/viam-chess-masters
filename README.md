@@ -108,7 +108,12 @@ requested target is missing or ambiguous.
 
 The SDK client disables its background connection probe because transferring a
 RealSense point cloud can take longer than the probe interval on this machine.
-Each operation remains bounded by `RPC_TIMEOUT_S`.
+3D localization has its own `DETECTION_TIMEOUT_S` (60 seconds by default), while
+ordinary resource and motion operations remain bounded by `RPC_TIMEOUT_S`.
+
+Physical execution prints each stage immediately. If an RPC fails, the final
+message identifies whether it happened during localization, approach, grasp,
+transport, placement, or recovery.
 
 Print the complete pick/place plan without sending arm or gripper commands:
 

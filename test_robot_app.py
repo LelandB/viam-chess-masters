@@ -50,6 +50,7 @@ def settings() -> Settings:
         place_z_mm=10,
         detection_attempts=6,
         detection_retry_delay_s=0.5,
+        detection_timeout_s=60,
         approach_clearance_mm=100,
         grasp_z_offset_mm=55,
         lift_clearance_mm=150,
@@ -117,6 +118,10 @@ class TargetLocationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target.label, "rectangle-green")
         self.assertEqual(vision.get_object_point_clouds.await_count, 2)
+        vision.get_object_point_clouds.assert_awaited_with(
+            config.camera_name,
+            timeout=config.detection_timeout_s,
+        )
         machine.transform_pose.assert_awaited_once()
 
     async def test_fails_closed_after_bounded_attempts(self):

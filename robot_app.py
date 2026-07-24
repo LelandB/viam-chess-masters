@@ -108,6 +108,7 @@ class Settings:
     place_z_mm: float
     detection_attempts: int
     detection_retry_delay_s: float
+    detection_timeout_s: float
     approach_clearance_mm: float
     grasp_z_offset_mm: float
     lift_clearance_mm: float
@@ -150,13 +151,19 @@ class Settings:
         settle = _float_env("SETTLE_S", 0.5)
         detection_attempts = _int_env("DETECTION_ATTEMPTS", 6)
         detection_retry_delay = _float_env("DETECTION_RETRY_DELAY_S", 0.5)
+        detection_timeout = _float_env("DETECTION_TIMEOUT_S", 60)
         if approach <= 0 or lift <= 0 or timeout <= 0 or settle < 0:
             raise ConfigurationError(
                 "Approach, lift, and timeout must be positive; settle cannot be negative"
             )
-        if detection_attempts <= 0 or detection_retry_delay < 0:
+        if (
+            detection_attempts <= 0
+            or detection_retry_delay < 0
+            or detection_timeout <= 0
+        ):
             raise ConfigurationError(
-                "Detection attempts must be positive; retry delay cannot be negative"
+                "Detection attempts and timeout must be positive; "
+                "retry delay cannot be negative"
             )
 
         return cls(
@@ -179,6 +186,7 @@ class Settings:
             place_z_mm=_float_env("PLACE_Z_MM", 10),
             detection_attempts=detection_attempts,
             detection_retry_delay_s=detection_retry_delay,
+            detection_timeout_s=detection_timeout,
             approach_clearance_mm=approach,
             # The live gripper's claw collision box reaches about 54.7 mm below
             # its frame. A 55 mm offset keeps the frame target distinct from the
@@ -300,7 +308,7 @@ async def locate_target(
     for attempt in range(1, settings.detection_attempts + 1):
         objects = await vision.get_object_point_clouds(
             settings.camera_name,
-            timeout=settings.rpc_timeout_s,
+            timeout=settings.detection_timeout_s,
         )
         try:
             obj, geometry = select_target_geometry(objects, settings.target_label)
@@ -539,9 +547,11 @@ async def pick_place(
     home = Switch.from_robot(machine, settings.home_pose_name)
     motion = MotionClient.from_robot(machine, settings.motion_name)
     vision = VisionClient.from_robot(machine, settings.segmenter_name)
+    stage = "execution preflight"
 
     try:
         if execute:
+            print("Execution stage: checking gripper state", flush=True)
             holding_before = await gripper.is_holding_something(
                 timeout=settings.rpc_timeout_s
             )
@@ -549,12 +559,19 @@ async def pick_place(
                 raise RobotMotionError(
                     "Gripper already reports holding an object; clear it before starting"
                 )
+            stage = "moving to the home/viewing pose"
+            print(f"Execution stage: {stage}", flush=True)
             await home.set_position(2, timeout=settings.rpc_timeout_s)
         else:
             print(
                 "DRY RUN: the arm was not moved to home; detection uses its current pose"
             )
 
+        stage = "3D target localization"
+        print(
+            f"Execution stage: {stage} (timeout {settings.detection_timeout_s:.0f}s)",
+            flush=True,
+        )
         target = await locate_target(machine, vision, settings)
         gripper_world = await motion.get_pose(
             settings.gripper_name,
@@ -571,14 +588,19 @@ async def pick_place(
         require_in_workspace("Place pose", place_world.pose, settings.workspace)
         plan = build_plan(target.pose_in_world, gripper_world, place_world, settings)
 
-        print(f"Target: {target.label!r}")
-        print(f"Target object center: {format_pose(target.pose_in_world)}")
+        print(f"Target: {target.label!r}", flush=True)
+        print(
+            f"Target object center: {format_pose(target.pose_in_world)}",
+            flush=True,
+        )
         for name, pose in plan.steps():
-            print(f"- {name}: {format_pose(pose)}")
+            print(f"- {name}: {format_pose(pose)}", flush=True)
         if not execute:
             print("DRY RUN COMPLETE: no arm or gripper commands were sent")
             return
 
+        stage = "pre-grasp approach"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -586,8 +608,12 @@ async def pick_place(
             "pre-grasp approach",
             settings.rpc_timeout_s,
         )
+        stage = "opening the gripper"
+        print(f"Execution stage: {stage}", flush=True)
         await gripper.open(timeout=settings.rpc_timeout_s)
         await asyncio.sleep(settings.settle_s)
+        stage = "linear grasp descent"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -596,6 +622,8 @@ async def pick_place(
             settings.rpc_timeout_s,
             linear=True,
         )
+        stage = "closing the gripper"
+        print(f"Execution stage: {stage}", flush=True)
         grabbed = await gripper.grab(timeout=settings.rpc_timeout_s)
         if not grabbed:
             raise RobotMotionError("Gripper closed without confirming a grasp")
@@ -604,6 +632,8 @@ async def pick_place(
         print(f"gripper holding status: {holding}")
         if holding is False:
             raise RobotMotionError("Gripper does not report holding the block")
+        stage = "vertical lift"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -612,6 +642,8 @@ async def pick_place(
             settings.rpc_timeout_s,
             linear=True,
         )
+        stage = "transport to pre-place"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -619,6 +651,8 @@ async def pick_place(
             "transport to pre-place",
             settings.rpc_timeout_s,
         )
+        stage = "linear place descent"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -627,8 +661,12 @@ async def pick_place(
             settings.rpc_timeout_s,
             linear=True,
         )
+        stage = "releasing the block"
+        print(f"Execution stage: {stage}", flush=True)
         await gripper.open(timeout=settings.rpc_timeout_s)
         await asyncio.sleep(settings.settle_s)
+        stage = "vertical retreat"
+        print(f"Execution stage: {stage}", flush=True)
         await move_checked(
             motion,
             settings.gripper_name,
@@ -637,11 +675,18 @@ async def pick_place(
             settings.rpc_timeout_s,
             linear=True,
         )
+        stage = "returning to the home/viewing pose"
+        print(f"Execution stage: {stage}", flush=True)
         await home.set_position(2, timeout=settings.rpc_timeout_s)
-        print("Pick-and-place cycle complete")
-    except Exception:
-        await arm.stop(timeout=settings.rpc_timeout_s)
-        raise
+        print("Pick-and-place cycle complete", flush=True)
+    except Exception as exc:
+        try:
+            await arm.stop(timeout=settings.rpc_timeout_s)
+        except (GRPCError, StreamTerminatedError, TimeoutError) as stop_exc:
+            print(f"Warning: arm stop also failed: {stop_exc}", flush=True)
+        if isinstance(exc, RobotMotionError):
+            raise
+        raise RobotMotionError(f"{stage} failed: {exc}") from exc
 
 
 async def stop(machine: RobotClient, settings: Settings) -> None:
