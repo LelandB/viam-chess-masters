@@ -11,7 +11,7 @@ import argparse
 import asyncio
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -279,13 +279,18 @@ def select_target_geometry(
         for geometry in geometries:
             label = getattr(geometry, "label", "")
             observed_labels.append(label or "<unlabeled>")
-            if label == target_label:
+            if target_label == "rectangle-*":
+                matches_target = label.startswith("rectangle-")
+            else:
+                matches_target = label == target_label
+            if matches_target:
                 matches.append((obj, geometry))
 
     if len(matches) != 1:
         labels = ", ".join(observed_labels) if observed_labels else "none"
         raise DetectionError(
-            f"Expected exactly one {target_label!r}; found {len(matches)}. "
+            f"Expected exactly one target matching {target_label!r}; "
+            f"found {len(matches)}. "
             f"Observed labels: {labels}"
         )
     return matches[0]
@@ -722,7 +727,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="Run read-only resource and frame checks")
-    subparsers.add_parser("detect", help="Locate one target in camera and world frames")
+    detect = subparsers.add_parser(
+        "detect", help="Locate one target in camera and world frames"
+    )
+    detect.add_argument(
+        "--target-label",
+        help=(
+            "Override TARGET_LABEL for this run; use an exact label such as "
+            "rectangle-blue or 'rectangle-*' for one rectangle of any color"
+        ),
+    )
 
     home = subparsers.add_parser(
         "home",
@@ -748,12 +762,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Acknowledge that the command can move the real arm and gripper",
     )
+    pick.add_argument(
+        "--target-label",
+        help=(
+            "Override TARGET_LABEL for this run; use an exact label such as "
+            "rectangle-blue or 'rectangle-*' for one rectangle of any color"
+        ),
+    )
     subparsers.add_parser("stop", help="Immediately request that arm-1 stop")
     return parser
 
 
 async def async_main(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
+    target_label = getattr(args, "target_label", None)
+    if target_label:
+        settings = replace(settings, target_label=target_label)
     machine = await connect(settings)
     try:
         if args.command == "doctor":

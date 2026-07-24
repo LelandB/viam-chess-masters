@@ -101,10 +101,27 @@ transform the wrist-camera pose to `world`:
 uv run python robot_app.py detect
 ```
 
+Select a different configured color without editing `.env`:
+
+```bash
+uv run python robot_app.py detect --target-label rectangle-blue
+```
+
+Or accept exactly one rectangular block of any color returned by the detector:
+
+```bash
+uv run python robot_app.py detect --target-label 'rectangle-*'
+```
+
+The quotes are required so the shell does not expand `*`. Any-color mode still
+fails closed when zero or multiple rectangular blocks are detected; it never
+chooses arbitrarily. The detector must already have a configured label for the
+color.
+
 The live shape detector uses fixed HSV thresholds. Reflections can make a block
 briefly appear under a neighboring color label, so `detect` retries a bounded
-number of times for the exact `TARGET_LABEL`. It still fails closed if the
-requested target is missing or ambiguous.
+number of times until the requested selector yields exactly one target. It still
+fails closed if the requested target is missing or ambiguous.
 
 The SDK client disables its background connection probe because transferring a
 RealSense point cloud can take longer than the probe interval on this machine.
@@ -152,6 +169,7 @@ warned, approve calibration for exactly one process and run one cycle:
 
 ```bash
 CALIBRATION_APPROVED=true uv run python robot_app.py pick-place \
+  --target-label 'rectangle-*' \
   --execute \
   --confirm-physical-motion
 ```
