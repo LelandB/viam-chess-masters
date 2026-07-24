@@ -97,6 +97,34 @@ class TargetSelectionTests(unittest.TestCase):
                 "rectangle-*",
             )
 
+    def test_selects_one_shape_of_requested_color(self):
+        _, geometry = select_target_geometry(
+            [fake_object("circle-red"), fake_object("triangle-blue")],
+            "*-blue",
+        )
+        self.assertEqual(geometry.label, "triangle-blue")
+
+    def test_selects_one_object_of_any_shape_and_color(self):
+        _, geometry = select_target_geometry(
+            [fake_object("triangle-yellow")],
+            "*",
+        )
+        self.assertEqual(geometry.label, "triangle-yellow")
+
+    def test_any_shape_and_color_rejects_multiple_objects(self):
+        with self.assertRaises(DetectionError):
+            select_target_geometry(
+                [fake_object("circle-red"), fake_object("triangle-blue")],
+                "*",
+            )
+
+    def test_any_shape_and_color_ignores_unlabeled_geometry(self):
+        _, geometry = select_target_geometry(
+            [fake_object(""), fake_object("triangle-blue")],
+            "*",
+        )
+        self.assertEqual(geometry.label, "triangle-blue")
+
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_disables_background_probe_for_large_point_cloud_rpc(self):

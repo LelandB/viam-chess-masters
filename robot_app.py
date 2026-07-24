@@ -1,4 +1,4 @@
-"""Safe Viam SDK app for detecting and moving one green rectangular block.
+"""Safe Viam SDK app for detecting and moving one labeled tabletop object.
 
 Commands are read-only unless ``home``, ``pick-place --execute``, or ``stop`` is used.
 Physical pick-and-place additionally requires ``--confirm-physical-motion``
@@ -12,6 +12,7 @@ import asyncio
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -279,11 +280,7 @@ def select_target_geometry(
         for geometry in geometries:
             label = getattr(geometry, "label", "")
             observed_labels.append(label or "<unlabeled>")
-            if target_label == "rectangle-*":
-                matches_target = label.startswith("rectangle-")
-            else:
-                matches_target = label == target_label
-            if matches_target:
+            if label and fnmatchcase(label, target_label):
                 matches.append((obj, geometry))
 
     if len(matches) != 1:
@@ -733,8 +730,8 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument(
         "--target-label",
         help=(
-            "Override TARGET_LABEL for this run; use an exact label such as "
-            "rectangle-blue or 'rectangle-*' for one rectangle of any color"
+            "Exact label or glob pattern; examples: rectangle-blue, "
+            "'circle-*', '*-blue', or '*'"
         ),
     )
 
@@ -765,8 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
     pick.add_argument(
         "--target-label",
         help=(
-            "Override TARGET_LABEL for this run; use an exact label such as "
-            "rectangle-blue or 'rectangle-*' for one rectangle of any color"
+            "Exact label or glob pattern; examples: rectangle-blue, "
+            "'circle-*', '*-blue', or '*'"
         ),
     )
     subparsers.add_parser("stop", help="Immediately request that arm-1 stop")

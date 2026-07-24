@@ -1,8 +1,8 @@
-# Viam green-block pick and place
+# Viam labeled-object pick and place
 
-Demo sentence: **When one green rectangular block is visible in the pickup
-zone, robot12 identifies it, moves it to the fixed place marker, and returns to
-the observation pose.**
+Demo sentence: **When one selected, center-graspable object is visible in the
+pickup zone, robot12 identifies it by shape/color label, moves it to the fixed
+place pose, and returns to the observation pose.**
 
 The application is intentionally an external Python SDK app. It does not add a
 custom service to `viam-server`.
@@ -107,16 +107,28 @@ Select a different configured color without editing `.env`:
 uv run python robot_app.py detect --target-label rectangle-blue
 ```
 
-Or accept exactly one rectangular block of any color returned by the detector:
+Target selection accepts exact labels or shell-style patterns:
 
 ```bash
+# One rectangle of any configured color
 uv run python robot_app.py detect --target-label 'rectangle-*'
+
+# One blue object of any configured shape
+uv run python robot_app.py detect --target-label '*-blue'
+
+# Exactly one detected object of any configured shape and color
+uv run python robot_app.py detect --target-label '*'
 ```
 
-The quotes are required so the shell does not expand `*`. Any-color mode still
-fails closed when zero or multiple rectangular blocks are detected; it never
-chooses arbitrarily. The detector must already have a configured label for the
-color.
+The quotes are required so the shell does not expand `*`. Pattern selection
+still fails closed when zero or multiple objects match; it never chooses
+arbitrarily. The detector must already produce labels in the expected
+`shape-color` form, such as `circle-red` or `triangle-blue`.
+
+Shape/color selection does not by itself make every physical object graspable.
+The current motion plan uses the detected 3D center, a fixed tool-height offset,
+and a top-down grasp. Keep physical targets similarly sized and center-graspable
+unless object-specific grasp offsets and orientations are calibrated.
 
 The live shape detector uses fixed HSV thresholds. Reflections can make a block
 briefly appear under a neighboring color label, so `detect` retries a bounded
